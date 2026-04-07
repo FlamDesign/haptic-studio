@@ -680,7 +680,7 @@ canvas#tl {
           <label class="tog on" id="togSfx"><input type="checkbox" checked/><span class="tg-dot" style="background:#33cc77"></span>SFX</label>
           <div class="tl-bar-right">
             <span class="zoom-label" id="zoomLabel">1.0×</span>
-            <span class="zoom-label" style="color:#303038">Pinch · Two-finger pan · Click ruler to seek · Drag event</span>
+            <span class="zoom-label" style="color:#303038">Pinch · Two-finger pan · Click ruler to seek · Drag event · Dbl-click delete · Z undo</span>
           </div>
         </div>
       </div>
@@ -911,6 +911,8 @@ video.addEventListener('timeupdate', () => {
       panOffset = Math.max(0, video.currentTime - vd * 0.05);
     }
   }
+  // Update bed intensity/sharpness live if a bed is selected
+  if (selected && selected.type === 'bed') updateSelUI();
   draw();
 });
 
@@ -1017,14 +1019,23 @@ tlWrap.addEventListener('touchend', e => {
   if (e.touches.length < 2) lastPinchDist = null;
 }, { passive: true });
 
-// ── Mouse interactions ──
-// Ruler click to seek; event drag
-const RULER_H  = 28 + 20; // tl-bar + ruler height
-const EVENT_H  = 60;      // event lane height below ruler
+// ── Lane geometry helper (mirrors draw) ──
+function getLanes() {
+  const BAR_H    = 28;
+  const RULER_H  = 20;
+  const RULER_TOP = BAR_H;
+  const avail    = tlH - RULER_TOP - RULER_H;
+  const TRANS_H  = Math.floor(avail * 0.40);
+  const BED_H    = Math.floor(avail * 0.30);
+  const CURVE_H  = avail - TRANS_H - BED_H;
+  const TRANS_TOP = RULER_TOP + RULER_H;
+  const BED_TOP   = TRANS_TOP + TRANS_H;
+  const CURVE_TOP = BED_TOP + BED_H;
+  return { RULER_TOP, RULER_H, TRANS_TOP, TRANS_H, BED_TOP, BED_H, CURVE_TOP, CURVE_H };
+}
 
+// ── Mouse interactions ──
 let dragging = null;
-let dragStarted = false;
-let mouseDownX = 0, mouseDownTime = 0;
 let isPanning = false;
 let panStartX = 0, panStartOffset = 0;
 
@@ -1033,35 +1044,40 @@ tlWrap.addEventListener('mousedown', e => {
   const rect = tlWrap.getBoundingClientRect();
   const x = e.clientX - rect.left;
   const y = e.clientY - rect.top;
-  mouseDownX = x;
-  dragStarted = false;
+  const L = getLanes();
 
-  const RULER_ZONE   = 28 + 20;  // tl-bar + ruler strip
-  const EVENT_TOP    = RULER_ZONE;
-  const EVENT_BOTTOM = EVENT_TOP + Math.floor((tlH - RULER_ZONE) * 0.5);
-
-  // Click ruler → seek
-  if (y < RULER_ZONE) {
-    const t = clamp(xToTime(x), 0, audioBuffer.duration);
-    video.currentTime = t;
-    // start dragging playhead
+  // Click ruler → seek + drag playhead
+  if (y >= L.RULER_TOP && y < L.RULER_TOP + L.RULER_H) {
+    video.currentTime = clamp(xToTime(x), 0, audioBuffer.duration);
     dragging = { type:'playhead' };
     return;
   }
 
-  // Click event lane → select / drag
-  if (y >= EVENT_TOP && y <= EVENT_BOTTOM) {
-    const hit = findNearest(x);
+  // Click transient lane
+  if (y >= L.TRANS_TOP && y < L.BED_TOP) {
+    const hit = findNearestTransient(x);
     if (hit) {
       pushUndo();
-      selected = { type:hit.type, id:hit.id };
-      updateSelUI();
-      dragging = { ...hit };
+      selected = { type:'transient', id:hit.id };
+      updateSelUI(); draw();
+      dragging = { type:'transient', id:hit.id };
       return;
     }
   }
 
-  // Waveform area → pan with drag
+  // Click bed lane
+  if (y >= L.BED_TOP && y < L.CURVE_TOP) {
+    const hit = findNearestBed(x);
+    if (hit) {
+      pushUndo();
+      selected = { type:'bed', id:hit.id };
+      updateSelUI(); draw();
+      dragging = { type:'bed', id:hit.id };
+      return;
+    }
+  }
+
+  // Curve lane → pan
   isPanning = true;
   panStartX = e.clientX;
   panStartOffset = panOffset;
@@ -1126,7 +1142,7 @@ tlWrap.addEventListener('dblclick', e => {
 });
 
 // ── Hit testing ──
-function findNearest(x) {
+function findNearestTransient(x) {
   if (!audioBuffer) return null;
   const thresh = 10;
   let best = null;
@@ -1134,16 +1150,25 @@ function findNearest(x) {
     for (const t of transients) {
       if (t.kind==='sfx' && !togSfx.querySelector('input').checked) continue;
       const dx = Math.abs(x - timeToX(t.time));
-      if (dx < thresh && (!best || dx < best.dx)) best = {type:'transient',id:t.id,dx};
-    }
-  }
-  if (togBeds.querySelector('input').checked) {
-    for (const b of beds) {
-      const dx = Math.abs(x - timeToX(b.start + b.duration/2));
-      if (dx < thresh && (!best || dx < best.dx)) best = {type:'bed',id:b.id,dx};
+      if (dx < thresh && (!best || dx < best.dx)) best = {type:'transient', id:t.id, dx};
     }
   }
   return best;
+}
+
+function findNearestBed(x) {
+  if (!audioBuffer) return null;
+  for (const b of beds) {
+    const x1 = timeToX(b.start);
+    const x2 = timeToX(b.start + b.duration);
+    if (x >= x1 - 4 && x <= x2 + 4) return {type:'bed', id:b.id};
+  }
+  return null;
+}
+
+// keep legacy findNearest for dblclick
+function findNearest(x) {
+  return findNearestTransient(x) || findNearestBed(x);
 }
 
 // ── DRAW ──
@@ -1152,7 +1177,6 @@ function draw() {
   const ctx = tlCtx;
   ctx.clearRect(0,0,tlW,tlH);
 
-  // Base background
   ctx.fillStyle = '#18181a';
   ctx.fillRect(0,0,tlW,tlH);
 
@@ -1165,21 +1189,17 @@ function draw() {
   }
 
   const dur = audioBuffer.duration;
-  const BAR_H = 28;       // tl-bar overlay height
-  const RULER_H = 20;     // ruler strip
-  const RULER_TOP = BAR_H;
-  const EVENT_TOP = RULER_TOP + RULER_H;
-  const remaining = tlH - EVENT_TOP;
-  const EVENT_H   = Math.floor(remaining * 0.5);   // 50% of remaining space
-  const WAVE_TOP  = EVENT_TOP + EVENT_H;
-  const WAVE_H    = tlH - WAVE_TOP;                // other 50%
+  const L = getLanes();
+  const { RULER_TOP, RULER_H, TRANS_TOP, TRANS_H, BED_TOP, BED_H, CURVE_TOP, CURVE_H } = L;
+
+  // ── Lane labels (left edge) ──
+  ctx.font = '8px JetBrains Mono, monospace';
+  ctx.textAlign = 'left';
+  const labelX = 5;
 
   // ── Ruler ──
   ctx.fillStyle = '#111116';
   ctx.fillRect(0, RULER_TOP, tlW, RULER_H);
-  ctx.strokeStyle = '#2a2a32';
-  ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.moveTo(0, RULER_TOP+RULER_H); ctx.lineTo(tlW, RULER_TOP+RULER_H); ctx.stroke();
 
   const vd = visDur();
   const interval = niceInterval(vd / (tlW / 70));
@@ -1189,147 +1209,145 @@ function draw() {
   for (let t = firstTick; t <= panOffset + vd + interval; t += interval) {
     const x = timeToX(t);
     if (x < 0 || x > tlW) continue;
-    ctx.strokeStyle = '#2a2a36';
+    ctx.strokeStyle = '#222228';
     ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(x, RULER_TOP+RULER_H); ctx.lineTo(x, tlH); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x, RULER_TOP + RULER_H); ctx.lineTo(x, tlH); ctx.stroke();
     ctx.fillStyle = '#606070';
-    ctx.fillText(fmtTime(t), x, RULER_TOP+RULER_H-5);
+    ctx.fillText(fmtTime(t), x, RULER_TOP + RULER_H - 5);
   }
 
-  // ── Event lane background ──
+  // ── Lane dividers ──
+  const drawDivider = (y, label) => {
+    ctx.strokeStyle = '#252530';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(tlW, y); ctx.stroke();
+    ctx.fillStyle = '#353540';
+    ctx.font = '8px JetBrains Mono, monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(label, labelX, y + 9);
+  };
+
+  // ── LANE 1: Transients ──
   ctx.fillStyle = '#0f0f12';
-  ctx.fillRect(0, EVENT_TOP, tlW, EVENT_H);
-  ctx.strokeStyle = '#1e1e24';
-  ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.moveTo(0, EVENT_TOP); ctx.lineTo(tlW, EVENT_TOP); ctx.stroke();
-  ctx.beginPath(); ctx.moveTo(0, EVENT_TOP+EVENT_H); ctx.lineTo(tlW, EVENT_TOP+EVENT_H); ctx.stroke();
+  ctx.fillRect(0, TRANS_TOP, tlW, TRANS_H);
+  drawDivider(TRANS_TOP, 'TRANSIENTS');
 
-  // ── Waveform ──
-  ctx.fillStyle = '#0d0d10';
-  ctx.fillRect(0, WAVE_TOP, tlW, WAVE_H);
+  if (togTrans.querySelector('input').checked) {
+    const gainScale = sv['gain']();
+    for (const tr of transients) {
+      if (tr.kind==='sfx' && !togSfx.querySelector('input').checked) continue;
+      const x = timeToX(tr.time);
+      if (x < -2 || x > tlW + 2) continue;
+      const isSel = selected && selected.type==='transient' && selected.id===tr.id;
+      const col = tr.kind==='sfx' ? '#33cc77' : '#e8500a';
+      const scaledInt = c01(tr.intensity * (tr.kind==='sfx' ? sv['sfxInt']() : sv['tInt']()) * gainScale);
+      const maxH = TRANS_H - 16;
+      const h = maxH * scaledInt;
+      const baseY = TRANS_TOP + TRANS_H - 6;
 
-  if (togEnv.querySelector('input').checked && envFull.length) {
-    ctx.beginPath();
-    let first=true;
-    for (let i=0;i<envFull.length;i++){
-      const x=timeToX(envTimes[i]);
-      if (x<-2||x>tlW+2) continue;
-      const y=WAVE_TOP + WAVE_H*(1-envFull[i]*0.88);
-      if(first){ctx.moveTo(x,WAVE_TOP+WAVE_H);ctx.lineTo(x,y);first=false;}
-      else ctx.lineTo(x,y);
-    }
-    if(!first){
-      ctx.lineTo(timeToX(dur), WAVE_TOP+WAVE_H);
-      ctx.closePath();
-      const g=ctx.createLinearGradient(0,WAVE_TOP,0,WAVE_TOP+WAVE_H);
-      g.addColorStop(0,'rgba(180,180,200,0.18)');
-      g.addColorStop(1,'rgba(100,100,120,0.04)');
-      ctx.fillStyle=g; ctx.fill();
-      ctx.strokeStyle='rgba(150,150,170,0.35)';
-      ctx.lineWidth=1; ctx.stroke();
+      if (isSel) { ctx.shadowColor = '#c8a050'; ctx.shadowBlur = 7; }
+      ctx.strokeStyle = isSel ? '#c8a050' : col;
+      ctx.lineWidth = isSel ? 2 : 1.5;
+      ctx.beginPath();
+      ctx.moveTo(x, baseY);
+      ctx.lineTo(x, baseY - h);
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+
+      ctx.beginPath();
+      ctx.arc(x, baseY - h, isSel ? 3.5 : 2.5, 0, Math.PI * 2);
+      ctx.fillStyle = isSel ? '#c8a050' : col;
+      ctx.fill();
     }
   }
 
-  // ── Beds in waveform ──
+  // ── LANE 2: Beds ──
+  ctx.fillStyle = '#0c0c10';
+  ctx.fillRect(0, BED_TOP, tlW, BED_H);
+  drawDivider(BED_TOP, 'BEDS');
+
   if (togBeds.querySelector('input').checked) {
+    const PAD = 8;
     for (const b of beds) {
-      const x1=timeToX(b.start), x2=timeToX(b.start+b.duration);
-      if(x2<0||x1>tlW) continue;
-      const isSel=selected&&selected.type==='bed'&&selected.id===b.id;
-      const bx=Math.max(0,x1), bw=Math.min(tlW,x2)-bx;
-      if(bw<=0) continue;
-      const g=ctx.createLinearGradient(0,WAVE_TOP,0,WAVE_TOP+WAVE_H);
-      g.addColorStop(0, isSel?'rgba(200,160,80,0.14)':'rgba(136,85,204,0.12)');
-      g.addColorStop(1,'rgba(0,0,0,0)');
-      ctx.fillStyle=g; ctx.fillRect(bx,WAVE_TOP,bw,WAVE_H);
-      ctx.strokeStyle=isSel?'rgba(200,160,80,0.5)':'rgba(136,85,204,0.35)';
-      ctx.lineWidth=1;
-      ctx.strokeRect(bx+.5,WAVE_TOP+.5,bw-1,WAVE_H-1);
-    }
-  }
+      const x1 = timeToX(b.start);
+      const x2 = timeToX(b.start + b.duration);
+      if (x2 < 0 || x1 > tlW) continue;
+      const isSel = selected && selected.type==='bed' && selected.id===b.id;
+      const bx = Math.max(0, x1);
+      const bw = Math.min(tlW, x2) - bx;
+      if (bw <= 0) continue;
 
-  // ── Intensity curve ──
-  if (togCurve.querySelector('input').checked && curvePoints.length>1) {
-    ctx.beginPath();
-    let fp=true;
-    for(const pt of curvePoints){
-      const x=timeToX(pt.time);
-      if(x<-2||x>tlW+2){fp=true;continue;}
-      const y=WAVE_TOP+WAVE_H*(1-pt.value*0.82);
-      if(fp){ctx.moveTo(x,y);fp=false;}else ctx.lineTo(x,y);
-    }
-    ctx.strokeStyle='rgba(74,159,207,0.55)'; ctx.lineWidth=1.5; ctx.stroke();
-  }
-
-  // ── Beds in event lane ──
-  if (togBeds.querySelector('input').checked) {
-    for (const b of beds) {
-      const x1=timeToX(b.start), x2=timeToX(b.start+b.duration);
-      if(x2<0||x1>tlW) continue;
-      const isSel=selected&&selected.type==='bed'&&selected.id===b.id;
-      const bx=Math.max(0,x1), bw=Math.min(tlW,x2)-bx;
-      if(bw<=0) continue;
-      const bedPad=6;
-      ctx.fillStyle=isSel?'rgba(200,160,80,0.28)':'rgba(136,85,204,0.22)';
-      ctx.fillRect(bx, EVENT_TOP+bedPad, bw, EVENT_H-bedPad*2);
-      ctx.strokeStyle=isSel?'#c8a050':'#8855cc';
-      ctx.lineWidth=isSel?1.5:1;
-      ctx.strokeRect(bx+.5, EVENT_TOP+bedPad+.5, bw-1, EVENT_H-bedPad*2-1);
+      ctx.fillStyle = isSel ? 'rgba(200,160,80,0.25)' : 'rgba(136,85,204,0.20)';
+      ctx.fillRect(bx, BED_TOP + PAD, bw, BED_H - PAD * 2);
+      ctx.strokeStyle = isSel ? '#c8a050' : '#8855cc';
+      ctx.lineWidth = isSel ? 1.5 : 1;
+      ctx.strokeRect(bx + .5, BED_TOP + PAD + .5, bw - 1, BED_H - PAD * 2 - 1);
 
       // Fade curve inside bed
-      if(b.fadePoints&&b.fadePoints.length>1){
+      if (b.fadePoints && b.fadePoints.length > 1) {
         ctx.beginPath();
-        let fp2=true;
-        for(const fp of b.fadePoints){
-          const fx=timeToX(b.start+fp.t*b.duration);
-          const fy=EVENT_TOP+bedPad+(EVENT_H-bedPad*2)*(1-fp.v*0.85);
-          if(fp2){ctx.moveTo(fx,fy);fp2=false;}else ctx.lineTo(fx,fy);
+        let fp2 = true;
+        for (const fp of b.fadePoints) {
+          const fx = timeToX(b.start + fp.t * b.duration);
+          const fy = BED_TOP + PAD + (BED_H - PAD * 2) * (1 - fp.v * 0.85);
+          if (fp2) { ctx.moveTo(fx, fy); fp2 = false; } else ctx.lineTo(fx, fy);
         }
-        ctx.strokeStyle=isSel?'rgba(220,180,90,0.9)':'rgba(200,160,255,0.55)';
-        ctx.lineWidth=1.2; ctx.stroke();
+        ctx.strokeStyle = isSel ? 'rgba(220,180,90,0.9)' : 'rgba(200,160,255,0.6)';
+        ctx.lineWidth = 1.2; ctx.stroke();
       }
     }
   }
 
-  // ── Transients in event lane ──
-  if (togTrans.querySelector('input').checked) {
-    for (const tr of transients) {
-      if(tr.kind==='sfx'&&!togSfx.querySelector('input').checked) continue;
-      const x=timeToX(tr.time);
-      if(x<-2||x>tlW+2) continue;
-      const isSel=selected&&selected.type==='transient'&&selected.id===tr.id;
-      const col=tr.kind==='sfx'?'#33cc77':'#e8500a';
-      const h=(EVENT_H-20)*c01(tr.intensity);
+  // ── LANE 3: Curve bars ──
+  ctx.fillStyle = '#0a0a0e';
+  ctx.fillRect(0, CURVE_TOP, tlW, CURVE_H);
+  drawDivider(CURVE_TOP, 'INTENSITY CURVE');
 
-      ctx.lineWidth=isSel?2:1.5;
-      if(isSel){ctx.shadowColor='#c8a050';ctx.shadowBlur=6;}
-      ctx.strokeStyle=isSel?'#c8a050':col;
-      ctx.beginPath();
-      ctx.moveTo(x, EVENT_TOP+EVENT_H-6);
-      ctx.lineTo(x, EVENT_TOP+EVENT_H-6-h);
-      ctx.stroke();
-      ctx.shadowBlur=0;
+  if (togCurve.querySelector('input').checked && curvePoints.length > 1) {
+    const gainScale = sv['gain']();
+    const barW = Math.max(1, (timeToX(curvePoints[1]?.time || 0) - timeToX(curvePoints[0]?.time || 0)) * 0.75);
+    const PAD = 10;
+    const usableH = CURVE_H - PAD - 4;
 
-      ctx.beginPath();
-      ctx.arc(x, EVENT_TOP+EVENT_H-6-h, isSel?3:2, 0, Math.PI*2);
-      ctx.fillStyle=isSel?'#c8a050':col;
-      ctx.fill();
+    for (let i = 0; i < curvePoints.length; i++) {
+      const pt = curvePoints[i];
+      const x = timeToX(pt.time);
+      if (x < -barW || x > tlW + barW) continue;
+      const val = c01(pt.value * gainScale);
+      const barH = usableH * val;
+      const by = CURVE_TOP + PAD + usableH - barH;
+
+      const alpha = 0.3 + val * 0.5;
+      ctx.fillStyle = `rgba(74,159,207,${alpha})`;
+      ctx.fillRect(x - barW / 2, by, barW, barH);
     }
+
+    // overlay line for readability
+    ctx.beginPath();
+    let fp = true;
+    for (const pt of curvePoints) {
+      const x = timeToX(pt.time);
+      if (x < -2 || x > tlW + 2) { fp = true; continue; }
+      const y = CURVE_TOP + PAD + (CURVE_H - PAD - 4) * (1 - c01(pt.value * gainScale) * 0.95);
+      if (fp) { ctx.moveTo(x, y); fp = false; } else ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = 'rgba(74,159,207,0.45)';
+    ctx.lineWidth = 1; ctx.stroke();
   }
 
-  // ── Playhead ──
+  // ── Playhead (across all lanes) ──
   if (video.readyState >= 1) {
-    const px=timeToX(video.currentTime);
-    if(px>=0&&px<=tlW){
-      ctx.strokeStyle='rgba(232,80,10,0.85)';
-      ctx.lineWidth=1;
-      ctx.setLineDash([]);
-      ctx.beginPath(); ctx.moveTo(px,RULER_TOP); ctx.lineTo(px,tlH); ctx.stroke();
-      // triangle on ruler
-      ctx.fillStyle='#e8500a';
+    const px = timeToX(video.currentTime);
+    if (px >= 0 && px <= tlW) {
+      ctx.strokeStyle = 'rgba(232,80,10,0.8)';
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(px, RULER_TOP); ctx.lineTo(px, tlH); ctx.stroke();
+      ctx.fillStyle = '#e8500a';
       ctx.beginPath();
-      ctx.moveTo(px-5,RULER_TOP); ctx.lineTo(px+5,RULER_TOP); ctx.lineTo(px,RULER_TOP+8); ctx.closePath();
-      ctx.fill();
+      ctx.moveTo(px - 5, RULER_TOP);
+      ctx.lineTo(px + 5, RULER_TOP);
+      ctx.lineTo(px, RULER_TOP + 8);
+      ctx.closePath(); ctx.fill();
     }
   }
 }
@@ -1546,6 +1564,21 @@ function updateStats(){
   document.getElementById('stCurve').textContent=curvePoints.length;
 }
 
+// ── Interpolate fade curve at a normalised position (0–1) ──
+function interpFade(fadePoints, frac) {
+  if (!fadePoints || fadePoints.length === 0) return 1;
+  if (frac <= fadePoints[0].t) return fadePoints[0].v;
+  if (frac >= fadePoints[fadePoints.length-1].t) return fadePoints[fadePoints.length-1].v;
+  for (let i = 1; i < fadePoints.length; i++) {
+    const a = fadePoints[i-1], b = fadePoints[i];
+    if (frac >= a.t && frac <= b.t) {
+      const t = (frac - a.t) / (b.t - a.t);
+      return a.v + (b.v - a.v) * t;
+    }
+  }
+  return 1;
+}
+
 // ── Selected event UI ──
 function updateSelUI(){
   if(!selected){
@@ -1553,6 +1586,7 @@ function updateSelUI(){
     selBadge.className='sel-type-badge';
     [selTime,selDur,selInt,selSharp,applySelBtn,deleteSelBtn].forEach(e=>e.disabled=true);
     selTime.value=selDur.value=selInt.value=selSharp.value=0;
+    hideBedPlayheadNote();
     return;
   }
   let ev=null;
@@ -1563,13 +1597,54 @@ function updateSelUI(){
   selBadge.className='sel-type-badge '+(selected.type==='transient'?'transient':'bed');
   selBadge.textContent=selected.type==='transient'?(ev.kind==='sfx'?'SFX Transient':'Music Transient'):'Continuous Bed';
   [selTime,selDur,selInt,selSharp,applySelBtn,deleteSelBtn].forEach(e=>e.disabled=false);
+
   if(selected.type==='transient'){
     selTime.value=+ev.time.toFixed(3); selDur.value=0; selDur.disabled=true;
     selInt.value=+c01(ev.intensity).toFixed(3); selSharp.value=+c01(ev.sharpness).toFixed(3);
+    hideBedPlayheadNote();
   } else {
     selTime.value=+ev.start.toFixed(3); selDur.value=+ev.duration.toFixed(3); selDur.disabled=false;
-    selInt.value=+c01(ev.intensity).toFixed(3); selSharp.value=+c01(ev.sharpness).toFixed(3);
+    // Check if playhead is inside this bed
+    const pt = video.currentTime;
+    const inside = pt >= ev.start && pt <= ev.start + ev.duration;
+    if (inside) {
+      const frac = (pt - ev.start) / ev.duration;
+      const fadeVal = interpFade(ev.fadePoints, frac);
+      const scaledInt = c01(ev.intensity * fadeVal * sv['bInt']() * sv['gain']());
+      selInt.value  = +scaledInt.toFixed(3);
+      selSharp.value = +c01(ev.sharpness).toFixed(3);
+      showBedPlayheadNote(pt);
+    } else {
+      selInt.value  = +c01(ev.intensity).toFixed(3);
+      selSharp.value = +c01(ev.sharpness).toFixed(3);
+      hideBedPlayheadNote();
+    }
   }
+}
+
+// ── Small note under the event editor showing "@ Xs (live)" ──
+function showBedPlayheadNote(t) {
+  let el = document.getElementById('bedLiveNote');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'bedLiveNote';
+    el.style.cssText = 'font-size:10px;font-family:var(--mono);color:var(--accent);margin-top:4px;display:flex;align-items:center;gap:5px';
+    el.innerHTML = '<span style="width:5px;height:5px;border-radius:50%;background:var(--accent);display:inline-block;animation:blink 1s ease infinite"></span><span id="bedLiveNoteText"></span>';
+    // inject blink keyframe once
+    if (!document.getElementById('blinkKf')) {
+      const s = document.createElement('style');
+      s.id = 'blinkKf';
+      s.textContent = '@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}';
+      document.head.appendChild(s);
+    }
+    document.getElementById('kvGrid').after(el);
+  }
+  el.style.display = 'flex';
+  document.getElementById('bedLiveNoteText').textContent = `Live @ ${t.toFixed(3)}s — intensity interpolated from fade curve`;
+}
+function hideBedPlayheadNote() {
+  const el = document.getElementById('bedLiveNote');
+  if (el) el.style.display = 'none';
 }
 
 applySelBtn.addEventListener('click',()=>{
