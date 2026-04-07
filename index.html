@@ -680,7 +680,7 @@ canvas#tl {
           <label class="tog on" id="togSfx"><input type="checkbox" checked/><span class="tg-dot" style="background:#33cc77"></span>SFX</label>
           <div class="tl-bar-right">
             <span class="zoom-label" id="zoomLabel">1.0×</span>
-            <span class="zoom-label" style="color:#303038">Pinch · Two-finger pan · Click ruler to seek · Drag event · Dbl-click delete · Z undo</span>
+            <span class="zoom-label" style="color:#303038">Pinch · Two-finger pan · Click ruler to seek · Drag event · Dbl-click delete · Space play/pause · Z undo</span>
           </div>
         </div>
       </div>
@@ -834,6 +834,12 @@ function pushUndo() {
 }
 
 window.addEventListener('keydown', e => {
+  // Spacebar play/pause — ignore if focus is on an input
+  if (e.key === ' ' && document.activeElement.tagName !== 'INPUT' && document.activeElement.tagName !== 'TEXTAREA') {
+    e.preventDefault();
+    if (video.paused) video.play(); else video.pause();
+    return;
+  }
   if ((e.key==='z'||e.key==='Z') && !e.ctrlKey && !e.metaKey && undoStack.length) {
     const s = JSON.parse(undoStack.pop());
     transients = s.transients||[];
